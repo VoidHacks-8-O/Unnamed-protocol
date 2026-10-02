@@ -1,0 +1,1341 @@
+import streamlit as st
+import pymupdf
+import duckdb
+import pandas as pd
+import io
+import re
+import time
+import hashlib
+from pathlib import Path
+
+
+# ============================================================
+# TRUSTNET V1
+# PDF Transaction Ingestion Engine
+# Dataset-specific parser for VoidHacks PDF structure
+# ============================================================
+
+st.set_page_config(
+    page_title="TRUSTNET V1",
+    page_icon="🔐",
+    layout="wide"
+)
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+DATA_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "trustnet.duckdb"
+PARQUET_PATH = DATA_DIR / "transactions.parquet"
+CACHE_META_PATH = DATA_DIR / "ingestion_meta.txt"
+
+
+# ============================================================
+# STANDARD SCHEMA
+# ============================================================
+
+COLUMNS = [
+    "transaction_id",
+    "timestamp",
+    "sender_account",
+    "receiver_account",
+    "amount",
+    "payment_type",
+    "sender_ifsc",
+    "receiver_ifsc",
+    "ip",
+    "user_agent",
+    "narration",
+]
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+def file_hash(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def database_ready():
+
+    if not DB_PATH.exists():
+        return False
+
+    try:
+        con = duckdb.connect(
+            str(DB_PATH),
+            read_only=True
+        )
+
+        result = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = 'transactions'
+            """
+        ).fetchone()[0]
+
+        con.close()
+
+        return result > 0
+
+    except Exception:
+        return False
+
+
+def database_count():
+
+    try:
+        con = duckdb.connect(
+            str(DB_PATH),
+            read_only=True
+        )
+
+        count = con.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
+
+        con.close()
+
+        return count
+
+    except Exception:
+        return 0
+
+
+# ============================================================
+# CLEANING
+# ============================================================
+
+def clean(value):
+
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    value = value.replace("\n", " ")
+    value = value.replace("\r", " ")
+
+    return value.strip()
+
+
+def clean_amount(value):
+
+    if value is None:
+        return None
+
+    value = str(value)
+
+    value = value.replace(",", "")
+    value = value.replace("₹", "")
+    value = value.replace("$", "")
+
+    match = re.search(
+        r"[-+]?\d+(?:\.\d+)?",
+        value
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group())
+    except Exception:
+        return None
+
+
+# ============================================================
+# PDF WORD EXTRACTION
+# ============================================================
+
+def get_page_words(page):
+
+    words = page.get_text("words")
+
+    result = []
+
+    for word in words:
+
+        if len(word) < 5:
+            continue
+
+        x0 = float(word[0])
+        y0 = float(word[1])
+        x1 = float(word[2])
+        y1 = float(word[3])
+        text = clean(word[4])
+
+        if not text:
+            continue
+
+        result.append({
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "text": text
+        })
+
+    return result
+
+
+# ============================================================
+# GROUP WORDS INTO VISUAL ROWS
+# ============================================================
+
+def group_words_into_rows(words):
+
+    if not words:
+        return []
+
+    words = sorted(
+        words,
+        key=lambda w: (
+            w["y0"],
+            w["x0"]
+        )
+    )
+
+    rows = []
+
+    current = []
+    current_y = None
+
+    for word in words:
+
+        y = word["y0"]
+
+        if current_y is None:
+
+            current_y = y
+            current = [word]
+            continue
+
+        # Same visual line
+        if abs(y - current_y) <= 3:
+
+            current.append(word)
+
+        else:
+
+            if current:
+                current.sort(
+                    key=lambda w: w["x0"]
+                )
+
+                rows.append(current)
+
+            current = [word]
+            current_y = y
+
+    if current:
+
+        current.sort(
+            key=lambda w: w["x0"]
+        )
+
+        rows.append(current)
+
+    return rows
+
+
+# ============================================================
+# ROW TO TEXT
+# ============================================================
+
+def row_text(row):
+
+    return " ".join(
+        w["text"]
+        for w in row
+    )
+
+
+# ============================================================
+# HEADER DETECTION
+# ============================================================
+
+def is_transaction_row(row):
+
+    text = row_text(row)
+
+    return bool(
+        re.search(
+            r"TXN\d+",
+            text,
+            re.IGNORECASE
+        )
+    )
+
+
+# ============================================================
+# EXTRACT TXN ID
+# ============================================================
+
+def extract_transaction_id(text):
+
+    match = re.search(
+        r"(TXN\d+)",
+        text,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    return match.group(1).upper()
+
+
+# ============================================================
+# ACCOUNT / IFSC DETECTION
+# ============================================================
+
+def looks_like_account(value):
+
+    value = value.strip()
+
+    # Examples:
+    # ICIC100003
+    # PYTM1000
+    # HDFC10000
+    # SBIN00013
+
+    return bool(
+        re.fullmatch(
+            r"[A-Z]{4}\d{3,7}",
+            value.upper()
+        )
+    )
+
+
+def looks_like_ifsc(value):
+
+    value = value.strip()
+
+    # IFSC-like:
+    # ICIC000133
+    # KKBK00010
+    # HDFC00018
+
+    return bool(
+        re.fullmatch(
+            r"[A-Z]{4}0\d{4,6}",
+            value.upper()
+        )
+    )
+
+
+# ============================================================
+# TOKEN EXTRACTION
+# ============================================================
+
+def extract_tokens(text):
+
+    # Remove transaction ID
+    text = re.sub(
+        r"TXN\d+",
+        " ",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Separate common PDF separators
+    text = text.replace("|", " ")
+    text = text.replace(",", " ")
+
+    tokens = text.split()
+
+    return [
+        clean(x)
+        for x in tokens
+        if clean(x)
+    ]
+
+
+# ============================================================
+# PARSE TRANSACTION ROW
+# ============================================================
+
+def parse_transaction_row(row):
+
+    text = row_text(row)
+
+    transaction_id = extract_transaction_id(
+        text
+    )
+
+    if not transaction_id:
+        return None
+
+    tokens = extract_tokens(text)
+
+    # --------------------------------------------------------
+    # Find amount
+    # --------------------------------------------------------
+
+    amount_index = None
+    amount = None
+
+    for i, token in enumerate(tokens):
+
+        candidate = clean_amount(token)
+
+        if candidate is None:
+            continue
+
+        # Amounts in this dataset are generally
+        # numeric and substantially larger than
+        # account suffixes.
+        if re.fullmatch(
+            r"\d+(?:\.\d+)?",
+            token.replace(",", "")
+        ):
+
+            amount = candidate
+            amount_index = i
+
+            break
+
+    if amount_index is None:
+        return None
+
+    before_amount = tokens[:amount_index]
+
+    after_amount = tokens[
+        amount_index + 1:
+    ]
+
+    # --------------------------------------------------------
+    # Accounts
+    # --------------------------------------------------------
+
+    accounts = []
+
+    for token in before_amount:
+
+        if looks_like_account(token):
+            accounts.append(
+                token.upper()
+            )
+
+    # --------------------------------------------------------
+    # IFSC
+    # --------------------------------------------------------
+
+    ifscs = []
+
+    for token in before_amount:
+
+        if looks_like_ifsc(token):
+
+            ifscs.append(
+                token.upper()
+            )
+
+    # --------------------------------------------------------
+    # Sender / receiver
+    # --------------------------------------------------------
+
+    sender = None
+    receiver = None
+
+    if len(accounts) >= 2:
+
+        sender = accounts[0]
+        receiver = accounts[1]
+
+    # --------------------------------------------------------
+    # Payment type
+    # --------------------------------------------------------
+
+    payment_type = None
+
+    payment_candidates = [
+        "UPI",
+        "IMPS",
+        "RTGS",
+        "NEFT"
+    ]
+
+    for token in after_amount:
+
+        upper = token.upper()
+
+        for payment in payment_candidates:
+
+            if upper == payment:
+
+                payment_type = payment
+                break
+
+        if payment_type:
+            break
+
+    # --------------------------------------------------------
+    # IP
+    # --------------------------------------------------------
+
+    ip = None
+
+    ip_match = re.search(
+        r"\b(?:\d{1,3}\.){2,3}\d{1,3}\b",
+        text
+    )
+
+    if ip_match:
+        ip = ip_match.group()
+
+    # --------------------------------------------------------
+    # Narration
+    # --------------------------------------------------------
+
+    narration = ""
+
+    if payment_type:
+
+        try:
+
+            payment_index = next(
+                i
+                for i, token in enumerate(after_amount)
+                if token.upper() == payment_type
+            )
+
+            narration_tokens = after_amount[
+                payment_index + 1:
+            ]
+
+            narration = " ".join(
+                narration_tokens
+            )
+
+        except StopIteration:
+            narration = ""
+
+    # --------------------------------------------------------
+    # Timestamp
+    # --------------------------------------------------------
+
+    timestamp = None
+
+    # The PDF currently exposes the timestamp
+    # as ########.
+    #
+    # Do NOT fabricate a timestamp.
+
+    timestamp_patterns = [
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{2}/\d{2}/\d{4}",
+        r"\d{2}-\d{2}-\d{4}",
+    ]
+
+    for pattern in timestamp_patterns:
+
+        match = re.search(
+            pattern,
+            text
+        )
+
+        if match:
+
+            timestamp = match.group()
+            break
+
+    return {
+        "transaction_id": transaction_id,
+        "timestamp": timestamp,
+        "sender_account": sender or "",
+        "receiver_account": receiver or "",
+        "amount": amount,
+        "payment_type": payment_type or "",
+        "sender_ifsc": ifscs[0] if len(ifscs) > 0 else "",
+        "receiver_ifsc": ifscs[1] if len(ifscs) > 1 else "",
+        "ip": ip or "",
+        "user_agent": "",
+        "narration": narration,
+    }
+
+
+# ============================================================
+# PDF PARSER
+# ============================================================
+
+def parse_pdf(file_bytes):
+
+    document = pymupdf.open(
+        stream=file_bytes,
+        filetype="pdf"
+    )
+
+    total_pages = len(document)
+
+    st.info(
+        f"📄 PDF loaded: {total_pages:,} pages"
+    )
+
+    progress = st.progress(0)
+
+    status = st.empty()
+
+    records = []
+
+    seen_transactions = set()
+
+    start = time.perf_counter()
+
+    for page_number in range(total_pages):
+
+        page = document[page_number]
+
+        words = get_page_words(page)
+
+        rows = group_words_into_rows(
+            words
+        )
+
+        for row in rows:
+
+            if not is_transaction_row(row):
+                continue
+
+            record = parse_transaction_row(
+                row
+            )
+
+            if record is None:
+                continue
+
+            transaction_id = record[
+                "transaction_id"
+            ]
+
+            if transaction_id in seen_transactions:
+                continue
+
+            seen_transactions.add(
+                transaction_id
+            )
+
+            records.append(record)
+
+        if page_number % 20 == 0:
+
+            progress.progress(
+                (page_number + 1)
+                / total_pages
+            )
+
+            elapsed = (
+                time.perf_counter()
+                - start
+            )
+
+            rate = (
+                len(records) / elapsed
+                if elapsed > 0
+                else 0
+            )
+
+            status.text(
+                f"Page {page_number + 1:,} / "
+                f"{total_pages:,}  |  "
+                f"Transactions: {len(records):,}  |  "
+                f"Rate: {rate:,.0f} rows/sec"
+            )
+
+    progress.progress(1.0)
+
+    document.close()
+
+    status.empty()
+
+    return records
+
+
+# ============================================================
+# NORMALIZE
+# ============================================================
+
+def normalize_dataframe(records):
+
+    if not records:
+        raise ValueError(
+            "No transactions could be extracted."
+        )
+
+    df = pd.DataFrame(
+        records,
+        columns=COLUMNS
+    )
+
+    # --------------------------------------------------------
+    # Strings
+    # --------------------------------------------------------
+
+    string_columns = [
+        "transaction_id",
+        "sender_account",
+        "receiver_account",
+        "payment_type",
+        "sender_ifsc",
+        "receiver_ifsc",
+        "ip",
+        "user_agent",
+        "narration",
+    ]
+
+    for column in string_columns:
+
+        df[column] = (
+            df[column]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+    # --------------------------------------------------------
+    # Amount
+    # --------------------------------------------------------
+
+    df["amount"] = pd.to_numeric(
+        df["amount"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Timestamp
+    # --------------------------------------------------------
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Remove invalid records
+    # --------------------------------------------------------
+
+    df = df[
+        df["transaction_id"].str.startswith(
+            "TXN"
+        )
+    ]
+
+    df = df[
+        df["sender_account"] != ""
+    ]
+
+    df = df[
+        df["receiver_account"] != ""
+    ]
+
+    df = df[
+        df["amount"].notna()
+    ]
+
+    # --------------------------------------------------------
+    # Remove duplicates
+    # --------------------------------------------------------
+
+    df = df.drop_duplicates(
+        subset=["transaction_id"],
+        keep="first"
+    )
+
+    # --------------------------------------------------------
+    # Keep schema
+    # --------------------------------------------------------
+
+    df = df[COLUMNS]
+
+    return df.reset_index(
+        drop=True
+    )
+
+
+# ============================================================
+# SAVE DATABASE
+# ============================================================
+
+def save_database(df):
+
+    start = time.perf_counter()
+
+    # --------------------------------------------------------
+    # Parquet
+    # --------------------------------------------------------
+
+    df.to_parquet(
+        PARQUET_PATH,
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # DuckDB
+    # --------------------------------------------------------
+
+    con = duckdb.connect(
+        str(DB_PATH)
+    )
+
+    con.execute(
+        "DROP TABLE IF EXISTS transactions"
+    )
+
+    con.register(
+        "df_input",
+        df
+    )
+
+    con.execute(
+        """
+        CREATE TABLE transactions AS
+        SELECT *
+        FROM df_input
+        """
+    )
+
+    con.unregister(
+        "df_input"
+    )
+
+    # --------------------------------------------------------
+    # Indexes
+    # --------------------------------------------------------
+
+    indexes = [
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_txn_id
+        ON transactions(transaction_id)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_sender
+        ON transactions(sender_account)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_receiver
+        ON transactions(receiver_account)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_payment
+        ON transactions(payment_type)
+        """
+    ]
+
+    for query in indexes:
+
+        try:
+            con.execute(query)
+        except Exception:
+            pass
+
+    try:
+        con.execute(
+            "ANALYZE transactions"
+        )
+    except Exception:
+        pass
+
+    con.close()
+
+    return (
+        time.perf_counter()
+        - start
+    )
+
+
+# ============================================================
+# DATABASE STATISTICS
+# ============================================================
+
+def database_stats():
+
+    con = duckdb.connect(
+        str(DB_PATH),
+        read_only=True
+    )
+
+    transactions = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM transactions
+        """
+    ).fetchone()[0]
+
+    accounts = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT sender_account AS account
+            FROM transactions
+
+            UNION
+
+            SELECT receiver_account AS account
+            FROM transactions
+        )
+        """
+    ).fetchone()[0]
+
+    amount = con.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM transactions
+        """
+    ).fetchone()[0]
+
+    payments = con.execute(
+        """
+        SELECT
+            payment_type,
+            COUNT(*) AS count
+        FROM transactions
+        GROUP BY payment_type
+        ORDER BY count DESC
+        """
+    ).df()
+
+    con.close()
+
+    return (
+        transactions,
+        accounts,
+        amount,
+        payments
+    )
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.title("🔐 TRUSTNET")
+
+    st.caption(
+        "Money-Flow Intelligence Engine"
+    )
+
+    st.divider()
+
+    st.markdown(
+        """
+### V1 DATA ENGINE
+
+**Input**
+
+PDF / CSV
+
+↓
+
+**Extraction**
+
+PyMuPDF
+
+↓
+
+**Normalization**
+
+Standard schema
+
+↓
+
+**Storage**
+
+DuckDB + Parquet
+
+↓
+
+**Next**
+
+4-Hop Investigation
+"""
+    )
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.title(
+    "🔐 TRUSTNET V1"
+)
+
+st.subheader(
+    "Transaction Dataset Intelligence Engine"
+)
+
+st.write(
+    "Convert the VoidHacks transaction PDF into a "
+    "queryable DuckDB evidence database."
+)
+
+
+# ============================================================
+# EXISTING DATABASE
+# ============================================================
+
+if database_ready():
+
+    count = database_count()
+
+    st.success(
+        f"🟢 Database ready — "
+        f"{count:,} transactions"
+    )
+
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+uploaded_file = st.file_uploader(
+    "Upload transaction dataset",
+    type=["pdf", "csv"]
+)
+
+
+# ============================================================
+# PROCESS
+# ============================================================
+
+if uploaded_file:
+
+    file_bytes = uploaded_file.getvalue()
+
+    st.info(
+        f"Loaded **{uploaded_file.name}** — "
+        f"{len(file_bytes) / 1024 / 1024:.2f} MB"
+    )
+
+    current_hash = file_hash(
+        file_bytes
+    )
+
+    cached_hash = ""
+
+    if CACHE_META_PATH.exists():
+
+        try:
+
+            cached_hash = (
+                CACHE_META_PATH
+                .read_text(
+                    encoding="utf-8"
+                )
+                .strip()
+            )
+
+        except Exception:
+            cached_hash = ""
+
+    if st.button(
+        "🚀 BUILD TRUSTNET DATABASE",
+        type="primary",
+        use_container_width=True
+    ):
+
+        total_start = time.perf_counter()
+
+        # ----------------------------------------------------
+        # CACHE
+        # ----------------------------------------------------
+
+        if (
+            current_hash == cached_hash
+            and database_ready()
+        ):
+
+            st.success(
+                "⚡ This dataset is already processed."
+            )
+
+            st.info(
+                "TRUSTNET is using the cached DuckDB database."
+            )
+
+        else:
+
+            try:
+
+                # ------------------------------------------------
+                # PDF
+                # ------------------------------------------------
+
+                if uploaded_file.name.lower().endswith(
+                    ".pdf"
+                ):
+
+                    st.info(
+                        "🔎 Parsing transaction PDF..."
+                    )
+
+                    records = parse_pdf(
+                        file_bytes
+                    )
+
+                # ------------------------------------------------
+                # CSV
+                # ------------------------------------------------
+
+                else:
+
+                    st.info(
+                        "📊 Reading CSV..."
+                    )
+
+                    raw = pd.read_csv(
+                        io.BytesIO(file_bytes),
+                        low_memory=False
+                    )
+
+                    records = (
+                        raw.to_dict(
+                            orient="records"
+                        )
+                    )
+
+                st.success(
+                    f"📥 Extracted "
+                    f"{len(records):,} candidate transactions."
+                )
+
+                # ------------------------------------------------
+                # Normalize
+                # ------------------------------------------------
+
+                st.info(
+                    "🧹 Normalizing transaction data..."
+                )
+
+                df = normalize_dataframe(
+                    records
+                )
+
+                st.success(
+                    f"✅ Valid transactions: "
+                    f"{len(df):,}"
+                )
+
+                # ------------------------------------------------
+                # Database
+                # ------------------------------------------------
+
+                st.info(
+                    "💾 Building DuckDB database..."
+                )
+
+                db_time = save_database(
+                    df
+                )
+
+                CACHE_META_PATH.write_text(
+                    current_hash,
+                    encoding="utf-8"
+                )
+
+                total_time = (
+                    time.perf_counter()
+                    - total_start
+                )
+
+                st.success(
+                    "🎉 TRUSTNET V1 DATABASE READY"
+                )
+
+                # ------------------------------------------------
+                # Metrics
+                # ------------------------------------------------
+
+                stats = database_stats()
+
+                c1, c2, c3, c4 = st.columns(4)
+
+                with c1:
+                    st.metric(
+                        "Transactions",
+                        f"{stats[0]:,}"
+                    )
+
+                with c2:
+                    st.metric(
+                        "Accounts",
+                        f"{stats[1]:,}"
+                    )
+
+                with c3:
+                    st.metric(
+                        "Total Value",
+                        f"{stats[2]:,.2f}"
+                    )
+
+                with c4:
+                    st.metric(
+                        "Build Time",
+                        f"{total_time:.2f}s"
+                    )
+
+                st.info(
+                    f"Database write time: "
+                    f"{db_time:.2f}s"
+                )
+
+            except Exception as e:
+
+                st.error(
+                    "❌ Dataset processing failed."
+                )
+
+                st.exception(e)
+
+                st.stop()
+
+
+# ============================================================
+# DATABASE DASHBOARD
+# ============================================================
+
+if database_ready():
+
+    st.divider()
+
+    st.subheader(
+        "📊 Dataset Intelligence"
+    )
+
+    try:
+
+        transactions, accounts, amount, payments = (
+            database_stats()
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric(
+                "Transactions",
+                f"{transactions:,}"
+            )
+
+        with c2:
+            st.metric(
+                "Unique Accounts",
+                f"{accounts:,}"
+            )
+
+        with c3:
+            st.metric(
+                "Transaction Value",
+                f"{amount:,.2f}"
+            )
+
+        st.subheader(
+            "💳 Payment Rails"
+        )
+
+        st.dataframe(
+            payments,
+            use_container_width=True
+        )
+
+    except Exception as e:
+
+        st.warning(
+            f"Statistics unavailable: {e}"
+        )
+
+
+# ============================================================
+# PREVIEW
+# ============================================================
+
+if database_ready():
+
+    st.divider()
+
+    st.subheader(
+        "🔎 Transaction Evidence Preview"
+    )
+
+    try:
+
+        con = duckdb.connect(
+            str(DB_PATH),
+            read_only=True
+        )
+
+        preview = con.execute(
+            """
+            SELECT
+                transaction_id,
+                timestamp,
+                sender_account,
+                receiver_account,
+                amount,
+                payment_type,
+                sender_ifsc,
+                receiver_ifsc,
+                ip,
+                narration
+            FROM transactions
+            LIMIT 100
+            """
+        ).df()
+
+        con.close()
+
+        st.dataframe(
+            preview,
+            use_container_width=True,
+            height=450
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Preview failed: {e}"
+        )
+
+
+# ============================================================
+# TIMESTAMP WARNING
+# ============================================================
+
+if database_ready():
+
+    st.divider()
+
+    st.warning(
+        "⚠️ Timestamp note: the supplied PDF renders its "
+        "timestamp field as `########`. TRUSTNET does not "
+        "invent timestamps. Timestamp-based analysis will "
+        "remain unavailable until the original timestamp "
+        "data is available."
+    )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "TRUSTNET V1 • Evidence-first transaction ingestion"
+)
