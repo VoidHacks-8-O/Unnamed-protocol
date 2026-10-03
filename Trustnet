@@ -1,0 +1,473 @@
+"""
+TRUSTNET V5 HEAVY DATA
+Cyber Fraud Intelligence & Money-Tracing Platform
+
+Single-file Flask prototype.
+
+Install (Linux/macOS):
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install Flask pandas openpyxl pypdf pdfplumber PyMuPDF pillow pytesseract python-pptx python-docx reportlab
+
+Optional OS tools for legacy Office files / OCR:
+    LibreOffice (soffice), tesseract
+
+Run:
+    python trustnet.py
+
+Then open:
+    http://127.0.0.1:5090
+
+Notes:
+- 8 GB PER FILE upload cap; CSV/PDF/ZIP datasets use disk-backed streaming.
+- ZIP bundles can contain PDF/CSV/JSON shards and are processed member-by-member.
+- Large datasets stay on disk; only a bounded analytical window is loaded into RAM.
+- Uploaded investigation data is processed locally; it is not sent to a model/API.
+- Freeze is SIMULATION ONLY; no bank/API action is performed.
+- Risk labels are computed from evidence present in the dataset.
+- Missing values are shown as NOT AVAILABLE; no fake identifiers are generated.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import gzip
+import csv
+import io
+import json
+import math
+import mimetypes
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import time
+import tempfile
+import threading
+import uuid
+import zipfile
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+from typing import Any, Iterable
+
+from flask import Flask, jsonify, render_template_string, request, send_file
+
+import pandas as pd
+
+# Optional parsers are imported defensively so TRUSTNET can still start if one is absent.
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+try:
+    import fitz  # PyMuPDF: substantially faster PDF text extraction path
+except Exception:
+    fitz = None
+try:
+    import ijson  # Optional streaming JSON parser for very large JSON datasets
+except Exception:
+    ijson = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+try:
+    from docx import Document
+except Exception:
+    Document = None
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics import renderSVG
+except Exception:
+    A4 = None
+    colors = None
+    getSampleStyleSheet = None
+    SimpleDocTemplate = None
+    ParagraphStyle = None
+    PageBreak = None
+    KeepTogether = None
+    QrCodeWidget = None
+    Drawing = None
+    renderSVG = None
+
+APP = Flask(__name__)
+APP.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # multi-file request ceiling; per-file cap enforced below
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "trustnet_storage"
+UPLOAD_DIR = DATA_DIR / "uploads"
+EXPORT_DIR = DATA_DIR / "exports"
+PDF_CACHE_DIR = DATA_DIR / "pdf_cache"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "trustnet_history.sqlite3"
+
+# Cached investigation payloads avoid repeating graph/verification work on every UI refresh.
+PAYLOAD_CACHE: dict[tuple[int, str, bool], dict[str, Any]] = {}
+CACHE_LOCK = threading.Lock()
+
+
+def init_history_db() -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS archived_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archived_at TEXT NOT NULL,
+            case_count INTEGER NOT NULL DEFAULT 0,
+            record_count INTEGER NOT NULL DEFAULT 0,
+            transaction_count INTEGER NOT NULL DEFAULT 0,
+            entity_count INTEGER NOT NULL DEFAULT 0,
+            note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS archived_cases (
+            snapshot_id INTEGER NOT NULL,
+            case_id TEXT NOT NULL,
+            filename TEXT,
+            size_bytes INTEGER,
+            uploaded_at TEXT,
+            rows_extracted INTEGER,
+            cleaned_rows INTEGER,
+            extraction_json TEXT,
+            PRIMARY KEY(snapshot_id, case_id),
+            FOREIGN KEY(snapshot_id) REFERENCES archived_snapshots(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS archived_records (
+            snapshot_id INTEGER NOT NULL,
+            row_no INTEGER NOT NULL,
+            transaction_id TEXT,
+            sender TEXT,
+            receiver TEXT,
+            amount REAL,
+            timestamp TEXT,
+            case_id TEXT,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id, row_no),
+            FOREIGN KEY(snapshot_id) REFERENCES archived_snapshots(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_archived_txn ON archived_records(snapshot_id, transaction_id);
+        CREATE TABLE IF NOT EXISTS archived_entities (
+            snapshot_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id, account_id),
+            FOREIGN KEY(snapshot_id) REFERENCES archived_snapshots(id) ON DELETE CASCADE
+        );
+        """)
+        # Schema migrations for the case database. These columns make the archive
+        # self-describing and give every saved case a stable report/QR token.
+        existing = {row[1] for row in con.execute("PRAGMA table_info(archived_cases)").fetchall()}
+        migrations = {
+            "victim_name": "TEXT",
+            "file_hash": "TEXT",
+            "report_token": "TEXT",
+            "report_url": "TEXT",
+            "database_saved_at": "TEXT",
+            "case_summary_json": "TEXT",
+        }
+        for col, typ in migrations.items():
+            if col not in existing:
+                con.execute(f"ALTER TABLE archived_cases ADD COLUMN {col} {typ}")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_archived_case_token ON archived_cases(report_token)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_archived_case_victim ON archived_cases(victim_name)")
+
+
+def history_count() -> int:
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            row = con.execute("SELECT COUNT(*) FROM archived_snapshots").fetchone()
+            return int(row[0] if row else 0)
+    except Exception:
+        return 0
+
+
+def infer_victim_name(case_id: str, records: list[dict[str, Any]], entities: dict[str, dict[str, Any]]) -> str:
+    """Resolve a victim name only from evidence already present in the uploaded dataset."""
+    for profile in entities.values():
+        if str(profile.get("role", "")).upper() == "VICTIM" and profile.get("name"):
+            return str(profile.get("name"))
+    for row in records:
+        if str(row.get("case_id") or "") != str(case_id):
+            continue
+        if str(row.get("role", "")).upper() == "VICTIM" and row.get("name"):
+            return str(row.get("name"))
+    return "NOT AVAILABLE"
+
+
+def archive_workspace_data(cases, records, cleaned, entities, note="Workspace archived by RESET WORKSPACE", include_bigdata: bool = False) -> int | None:
+    if not cases and not records and not entities:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA journal_mode=WAL")
+        estimated_transactions = sum(int(c.get("rows_extracted") or 0) for c in cases.values()) if any(c.get("extraction", {}).get("large_mode") for c in cases.values()) else len(cleaned)
+        cur = con.execute(
+            "INSERT INTO archived_snapshots(archived_at,case_count,record_count,transaction_count,entity_count,note) VALUES(?,?,?,?,?,?)",
+            (now, len(cases), len(records), estimated_transactions, len(entities), note)
+        )
+        sid = int(cur.lastrowid)
+        saved_at = datetime.now(timezone.utc).isoformat()
+        case_rows = []
+        for c in cases.values():
+            token = c.get("report_token") or uuid.uuid4().hex
+            c["report_token"] = token
+            victim_name = c.get("victim_name") or infer_victim_name(c.get("case_id"), records, entities)
+            c["victim_name"] = victim_name
+            report_url = c.get("report_url") or f"/report/{token}"
+            c["report_url"] = report_url
+            summary = {
+                "case_id": c.get("case_id"),
+                "filename": c.get("filename"),
+                "victim_name": victim_name,
+                "rows_extracted": c.get("rows_extracted", 0),
+                "cleaned_rows": c.get("cleaned_rows", 0),
+                "uploaded_at": c.get("uploaded_at"),
+                "file_hash": c.get("file_hash"),
+                "extraction": c.get("extraction", {}),
+            }
+            case_rows.append((sid, c.get("case_id"), c.get("filename"), c.get("size_bytes"), c.get("uploaded_at"), c.get("rows_extracted"), c.get("cleaned_rows", 0), json.dumps(c.get("extraction", {}), default=str), victim_name, c.get("file_hash"), token, report_url, saved_at, json.dumps(summary, default=str)))
+        if case_rows:
+            con.executemany(
+                "INSERT INTO archived_cases(snapshot_id,case_id,filename,size_bytes,uploaded_at,rows_extracted,cleaned_rows,extraction_json,victim_name,file_hash,report_token,report_url,database_saved_at,case_summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                case_rows
+            )
+        large_cases = {str(c.get("case_id")) for c in cases.values() if c.get("extraction", {}).get("large_mode")}
+        if include_bigdata and large_cases and BIGDATA_DB_PATH.exists():
+            row_no = 0
+            with sqlite3.connect(BIGDATA_DB_PATH) as src:
+                cur_src = src.execute("SELECT transaction_id,sender,receiver,amount,timestamp,case_id,record_json FROM transactions ORDER BY row_id")
+                batch = []
+                for transaction_id, sender, receiver, amount, timestamp, case_id, record_json in cur_src:
+                    batch.append((sid, row_no, transaction_id, sender, receiver, amount, str(timestamp or ""), case_id, record_json))
+                    row_no += 1
+                    if len(batch) >= BIGDATA_SQL_BATCH:
+                        con.executemany("INSERT INTO archived_records(snapshot_id,row_no,transaction_id,sender,receiver,amount,timestamp,case_id,record_json) VALUES(?,?,?,?,?,?,?,?,?)", batch)
+                        batch.clear()
+                if batch:
+                    con.executemany("INSERT INTO archived_records(snapshot_id,row_no,transaction_id,sender,receiver,amount,timestamp,case_id,record_json) VALUES(?,?,?,?,?,?,?,?,?)", batch)
+        else:
+            record_rows = [(sid, i, r.get("transaction_id"), r.get("sender"), r.get("receiver"), parse_amount(r.get("amount")), str(r.get("timestamp") or ""), r.get("case_id"), json.dumps(r, default=str)) for i, r in enumerate(records)]
+            if record_rows:
+                con.executemany("INSERT INTO archived_records(snapshot_id,row_no,transaction_id,sender,receiver,amount,timestamp,case_id,record_json) VALUES(?,?,?,?,?,?,?,?,?)", record_rows)
+        entity_rows = [(sid, str(k), json.dumps(profile, default=str)) for k, profile in entities.items()]
+        if entity_rows:
+            con.executemany("INSERT INTO archived_entities(snapshot_id,account_id,profile_json) VALUES(?,?,?)", entity_rows)
+        con.commit()
+    return sid
+
+def archive_current_workspace() -> int | None:
+    return archive_workspace_data(STATE.get("cases", {}), STATE.get("records", []), STATE.get("transactions", []), STATE.get("entity_profiles", {}), include_bigdata=bool(STATE.get("large_mode")))
+
+def archive_snapshot_async(snapshot, note="Workspace archived asynchronously before RESET/REPLACE", include_bigdata: bool = False):
+    def worker():
+        try:
+            with STATE_LOCK:
+                STATE["database_status"] = "SAVING"
+            sid = archive_workspace_data(*snapshot, note=note, include_bigdata=include_bigdata)
+            with STATE_LOCK:
+                STATE["archive_count"] = history_count()
+                STATE["last_archive_snapshot_id"] = sid
+                STATE["database_status"] = "SAVED"
+        except Exception as exc:
+            with STATE_LOCK:
+                STATE["database_status"] = f"ERROR: {type(exc).__name__}"
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def invalidate_caches() -> None:
+    with CACHE_LOCK:
+        PAYLOAD_CACHE.clear()
+
+
+def set_process_progress(phase: str, percent: float, message: str = "", **extra) -> None:
+    with PROCESS_LOCK:
+        PROCESS_STATE.update({
+            "phase": phase,
+            "percent": max(0, min(100, round(float(percent), 1))),
+            "message": message or phase.replace("_", " ").title(),
+            **extra,
+        })
+
+
+def start_process_job(total_files: int) -> str:
+    job_id = uuid.uuid4().hex
+    with PROCESS_LOCK:
+        PROCESS_STATE.update({
+            "job_id": job_id, "phase": "processing", "percent": 0,
+            "message": "Preparing dataset…", "filename": "", "rows": 0,
+            "processed_files": 0, "total_files": total_files,
+            "started_at": time.time(), "finished_at": None, "error": None, "active": True
+        })
+    return job_id
+
+
+def finish_process_job(message: str = "Dataset processed successfully") -> None:
+    with PROCESS_LOCK:
+        PROCESS_STATE.update({"phase": "complete", "percent": 100, "message": message,
+                              "finished_at": time.time(), "active": False})
+
+
+def fail_process_job(message: str) -> None:
+    with PROCESS_LOCK:
+        PROCESS_STATE.update({"phase": "error", "message": message, "error": message,
+                              "finished_at": time.time(), "active": False})
+
+
+init_history_db()
+
+ALLOWED_EXTENSIONS = {
+    ".csv", ".json", ".pdf", ".zip", ".png", ".jpg", ".jpeg",
+    ".xls", ".xlsx", ".ppt", ".pptx", ".doc", ".docx"
+}
+MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB per file
+MAX_ZIP_UNCOMPRESSED_BYTES = 24 * 1024 * 1024 * 1024  # 24 GB safety ceiling for ZIP expansion
+LARGE_DATASET_BYTES = 25 * 1024 * 1024
+CSV_CHUNK_ROWS = 50_000
+BIGDATA_SQL_BATCH = 20_000
+PROCESS_LOCK = threading.Lock()
+PROCESS_STATE: dict[str, Any] = {
+    "job_id": None, "phase": "idle", "percent": 0, "message": "Ready",
+    "filename": "", "rows": 0, "processed_files": 0, "total_files": 0,
+    "started_at": None, "finished_at": None, "error": None, "active": False
+}
+
+# Big-data mode: keep the complete dataset on disk and only a bounded analytical
+# window in RAM. This prevents multi-million-row CSVs from becoming Python lists.
+BIGDATA_DB_PATH = DATA_DIR / "bigdata_active_v5.sqlite3"
+BIGDATA_MEMORY_ROWS = 300_000
+BIGDATA_CONTEXT_ROWS = 60_000
+
+def init_bigdata_db() -> None:
+    with sqlite3.connect(BIGDATA_DB_PATH) as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA temp_store=FILE")
+        con.execute("""CREATE TABLE IF NOT EXISTS transactions (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id TEXT, sender TEXT, receiver TEXT, amount REAL, timestamp TEXT,
+            timestamp_unavailable INTEGER DEFAULT 0, case_id TEXT, record_json TEXT NOT NULL
+        )""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_big_txn ON transactions(transaction_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_big_sender ON transactions(sender)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_big_receiver ON transactions(receiver)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_big_time ON transactions(timestamp)")
+        con.commit()
+
+init_bigdata_db()
+
+# Shared in-process investigation state: both workflow options read this same state.
+STATE_LOCK = threading.Lock()
+STATE: dict[str, Any] = {
+    "cases": {},
+    "records": [],
+    "accounts": {},
+    "transactions": [],
+    "extractions": [],
+    "entity_profiles": {},
+    "active_case_ids": [],
+    "last_query": None,
+    "selected_payload": None,
+    "version": 3,
+    "analysis_seconds": 0.0,
+    "feature_cache": {},
+    "archive_count": history_count(),
+    "file_hashes": {},
+    "large_mode": False,
+    "bigdata_db": str(BIGDATA_DB_PATH),
+    "all_transaction_count": 0,
+    "analytics_transaction_count": 0,
+    "database_status": "READY",
+    "last_archive_snapshot_id": None,
+}
+
+COLUMN_ALIASES = {
+    "transaction_id": ["transaction_id", "txn_id", "transactionid", "txn", "transaction", "utr", "rrn", "id"],
+    "sender": ["sender", "from", "payer", "origin", "source", "source_account", "sender_account", "debited_account", "account_from"],
+    "receiver": ["receiver", "to", "payee", "destination", "recipient", "target", "receiver_account", "credited_account", "account_to"],
+    "amount": ["amount", "transaction_amount", "txn_amount", "value", "money", "fraud_amount", "transfer_amount"],
+    "timestamp": ["timestamp", "datetime", "date_time", "date", "time", "transaction_time", "txn_time", "created_at", "event_time"],
+    "name": ["name", "account_holder", "account_name", "holder_name", "customer_name", "user_name", "beneficiary_name"],
+    "age": ["age"],
+    "gender": ["gender", "sex"],
+    "address": ["address", "location_address", "residential_address"],
+    "phone": ["phone", "phone_number", "mobile", "mobile_number", "contact"],
+    "upi_id": ["upi", "upi_id", "vpa", "upi_vpa"],
+    "bank_account": ["bank_account", "account_number", "account_no", "bank_account_number", "acct_no"],
+    "ifsc": ["ifsc", "ifsc_code"],
+    "ip": ["ip", "ip_address", "source_ip"],
+    "device_id": ["device_id", "device", "device_identifier"],
+    "location": ["location", "geo", "geolocation", "atm_location", "merchant_location"],
+    "merchant": ["merchant", "merchant_name", "atm", "atm_id", "terminal", "device_name"],
+    "payment_mode": ["payment_mode", "paymentmode", "payment_method", "method"],
+    "narration": ["narration", "description", "remarks", "transaction_description", "details"],
+    "case_id": ["case_id", "case", "investigation_id", "caseid"],
+}
+
+SENSITIVE_FIELDS = {"phone", "bank_account", "upi_id", "address", "ip", "device_id"}
+
+
+def norm_col(value: Any) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return s
+
+
+def safe_filename(name: str) -> str:
+    name = Path(name or "file").name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name[:180] or "file"
+
+
+def mask_value(field: str, value: Any) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "NOT AVAILABLE"
+    s = str(value)
+    if not s.strip():
+        return "NOT AVAILABLE"
+    if field == "phone":
+        digits = re.sub(r"\D", "", s)
+        return (digits[:5] + "XXXXX") if len(digits) >= 5 else "XXXXX"
+    if field == "bank_account":
+        return "X" * max(0, len(s) - 4) + s[-4:] if len(s) > 4 else "XXXX"
+    if field == "upi_id":
+        if "@" in s:
+            user, dom = s.split("@", 1)
+            return (user[:1] + "***@" + dom) if user else "***@" + dom
+        return "***"
+    if field == "address":
+        parts = s.split()
+        return " ".join(parts[:2]) + (" …" if len(parts) > 2 else "")
+    if field == "ip":
+        p = s.split(".")
+        return ".".join(p[:2] + ["x", "x"]) if len(p) == 4 else "***"
+    if field == "device_id":
+        return s[:3] + "***" if len(s) > 3 else "***"
+    return
